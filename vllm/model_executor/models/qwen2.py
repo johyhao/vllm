@@ -29,13 +29,15 @@ from collections.abc import Iterable
 from itertools import islice
 from typing import Any
 
+import os
+import sys
 import torch
 from torch import nn
 from transformers import Qwen2Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import get_pp_group, get_tp_group, get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -78,7 +80,94 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+from vllm.forward_context import get_forward_context
 
+_pypto_loaded = False
+_AttentionTileConfig = None
+_qwen3_decode_pypto = None
+
+def load_pypto_kernel():
+    global _pypto_loaded, _AttentionTileConfig, _qwen3_decode_pypto
+    if _pypto_loaded:
+        return _qwen3_decode_pypto is not None
+    pypto_models_dir = os.environ.get("PYPTO_QWEN3_MODELS_DIR", "")
+    pypto_qwen3_32b_dir = os.path.join(pypto_models_dir, "qwen3_32b")
+    pypto_parent_dir = os.path.dirname(pypto_models_dir)
+
+    for path in [pypto_parent_dir, pypto_qwen3_32b_dir]:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+    from models.qwen3_32b.w8a8_dynamic.qwen3_w8a8_dynamic_kernel import (
+        AttentionTileConfig, qwen3_decode_worker_a8a8
+    )
+    _AttentionTileConfig = AttentionTileConfig
+    _qwen3_decode_pypto = qwen3_decode_worker_a8a8
+    _pypto_loaded = True
+    return _pypto_loaded is not None
+
+def is_pypto_enabled():
+    if os.environ.get("VLLM_ASCEND_ENABLE_PYPTO_QWEN3", "0") != "1":
+        return False
+    return load_pypto_kernel()
+
+def build_tile_config(world_size, layer):
+    s2 = layer.self_attn.hidden_size
+    n1 = layer.self_attn.num_heads // world_size
+    n2 = layer.self_attn.num_kv_heads // world_size
+    cube_tile = 128
+    vector_tiel = 128
+    s2_tile = min(512, s2)
+    g = n1 // n2 if n2 > 0 else 1
+    tile_cfg = _AttentionTileConfig(
+        g_tile=g,
+        s2_tile=s2_tile,
+        c1_tile_shape=[[cube_tile, cube_tile], [cube_tile, cube_tile], [cube_tile, cube_tile]],
+        v1_tile_shape=[vevor_tile, s2_tile],
+        c2_tile_shape=[[cube_tile, cube_tile], [cube_tile, cube_tile], [cube_tile, cube_tile]],
+        v2_tile_shape=[vector_tiel, vector_tiel]
+    )
+    return tile_cfg
+
+def extract_attn_metadata(self_attn_layer):
+    forward_context = get_forward_context()
+    attn_metadata_dict = forward_context.attn_metadata
+
+    layer_name = getattr(self_attn_layer.self_attn.attn, "layer_name", None)
+    block_tables = None
+    slot_mapping = None
+    actual_seq_lens = None
+
+    if layer_name and attn_metadata_dict and layer_name in attn_metadata_dict:
+        meta = attn_metadata_dict[layer_name]
+        block_tables = getattr(meta, "block_tables", None)
+        slot_mapping = getattr(meta, "slot_mapping", None)
+        actual_seq_lens = getattr(meta, "seq_lens", None)
+    return block_tables, slot_mapping, actual_seq_lens
+
+def extract_kv_caches():
+    key_cache = None
+    value_cache = None
+    forward_context = get_forward_context()
+    global_kv_caches = getattr(forward_context, "contiguous_kv_cache", None)
+    if global_kv_caches is not None:
+        key_cache = global_kv_caches[0]
+        value_cache = global_kv_caches[1]
+    return key_cache, value_cache
+
+def extract_cos_sin(self_attn_layer, positions, hidden_states):
+    bs = hidden_states.shape[0]
+    self_attn = self_attn_layer.self_attn
+    head_dim = self_attn.head_dim
+    half_rotary_dim = (head_dim // 2) // 2
+    cos_sin_cache = self_attn.rotary_emb.cos_sin_cache
+    pos_flat = positions.flatten()
+    cos_sin = cos_sin_cache.index_select(0, pos_flat)
+    cos_full, sin_full = cos_sin.chunk(2, dim=-1)
+
+    cos = cos_full[:bs, :half_rotary_dim].reshape(bs, 1, half_rotary_dim).to(torch.bfloat16).contiguous()
+    sin = sin_full[:bs, :half_rotary_dim].reshape(bs, 1, half_rotary_dim).to(torch.bfloat16).contiguous()
+    return cos, sin
 
 class Qwen2MLP(nn.Module):
     def __init__(
@@ -419,6 +508,52 @@ class Qwen2Model(nn.Module, EagleModelMixin):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
+    def pypto_decode(self, positions, hidden_states, residual):
+        rank = get_tensor_model_parallel_rank()
+        world_size = get_tensor_model_parallel_world_size()
+        layer_list = list(self.layers[self.start_layer:self.end_layer])
+        device = hidden_states.device
+        if residual is None:
+            residual = torch.rand(hidden_states.shape, dtype=hidden_states.dtype, device=device)
+        key_cache, value_cache = extract_kv_cache()
+        cos, sin = extract_cos_sin(layer_list[0], positions, hidden_states)
+        block_tables, slot_mapping, actual_seq_lens = extract_attn_metadata(layer_list[0])
+        tile_cfg = build_tile_config(world_size, layer_list[0])
+        softmax_scale = layer_list[0].self_attn.head_dim ** -0.5
+        group_name = get_tp_group().device_group._get_backend(device).get_hccl_comm_name(rank)
+
+        out_torch, residual_out = _qwen3_decode_pypto(
+            layer_num=len(layer_list),
+            hidden_states=hidden_states,
+            residual=residual,
+            input_layernorm_weight=self.weights["input_layernorm_weight"],
+            output_layernorm_weight=self.weights["output_layernorm_weight"],
+            qkv_proj_weight=self.weights["qkv_proj_weight"],
+            qkv_weight_scale=self.weights["qkv_weight_scale"],
+            o_proj_weight=self.weights["o_proj_weight"],
+            o_proj_weight_scale=self.weights["o_proj_weight_scale"],
+            q_norm_weight=self.weights["q_norm_weight"],
+            k_norm_weight=self.weights["k_norm_weight"],
+            w13=self.weights["w13"],
+            w13_scale=self.weights["w13_scale"],
+            w2=self.weights["w2"],
+            cos=cos,
+            sin=sin,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            block_tables=block_tables,
+            actual_seq_lens=actual_seq_lens,
+            slot_mapping=slot_mapping,
+            eps=1e-5,
+            enable_residual=True,
+            num_decode_tokens=0,
+            softmax_scale=softmax_scale,
+            tile_cfg=tile_cfg,
+            group_name=group_name,
+            world_size=world_size
+        )
+        return out_torch, residual_out
+
     def forward(
         self,
         input_ids: torch.Tensor | None,
@@ -438,13 +573,17 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        for idx, layer in enumerate(
-            islice(self.layers, self.start_layer, self.end_layer)
-        ):
-            hidden_states, residual = layer(positions, hidden_states, residual)
-            self._maybe_add_hidden_state(
-                aux_hidden_states, idx + 1, hidden_states, residual
-            )
+        forward_context = get_forward_context()
+        if is_pypto_enabled() and forward_context.attn_metadata is not None:
+            hidden_states, residual = self.pypto_decode(positions, hidden_states, residual)
+        else:
+            for idx, layer in enumerate(
+                islice(self.layers, self.start_layer, self.end_layer)
+            ):
+                hidden_states, residual = layer(positions, hidden_states, residual)
+                self._maybe_add_hidden_state(
+                    aux_hidden_states, idx + 1, hidden_states, residual
+                )
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
