@@ -107,7 +107,7 @@ def load_pypto_kernel():
     return _pypto_loaded is not None
 
 def is_pypto_enabled():
-    if os.environ.get("VLLM_ASCEND_ENABLE_PYPTO_QWEN3", "0") != "1":
+    if os.environ.get("VLLM_ASCEND_ENABLE_PYPTO", "0") != "1":
         return False
     return load_pypto_kernel()
 
@@ -116,16 +116,16 @@ def build_tile_config(world_size, layer):
     n1 = layer.self_attn.num_heads // world_size
     n2 = layer.self_attn.num_kv_heads // world_size
     cube_tile = 128
-    vector_tiel = 128
+    vector_tile = 128
     s2_tile = min(512, s2)
     g = n1 // n2 if n2 > 0 else 1
     tile_cfg = _AttentionTileConfig(
         g_tile=g,
         s2_tile=s2_tile,
         c1_tile_shape=[[cube_tile, cube_tile], [cube_tile, cube_tile], [cube_tile, cube_tile]],
-        v1_tile_shape=[vevor_tile, s2_tile],
+        v1_tile_shape=[vector_tile, s2_tile],
         c2_tile_shape=[[cube_tile, cube_tile], [cube_tile, cube_tile], [cube_tile, cube_tile]],
-        v2_tile_shape=[vector_tiel, vector_tiel]
+        v2_tile_shape=[vector_tile, vector_tile]
     )
     return tile_cfg
 
@@ -504,26 +504,49 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
+        self.init_pypto_tensor()
+
+    def init_pypto_tensor(self):
+        dtype = torch.bfloat16
+        device = self.weights["qkv_proj_weight"].device
+        bs = 128
+        hidden_size = 5120
+        total_head_size = self.weights["qkv_proj_weight"].shape[-1]
+        head_size = self.weights["q_norm_weight"].shape[-1]
+        self.key_cache, self.value_cache = extract_kv_caches()
+        kv_shape = self.key_cache.shape
+        n2 = kv_shape[-2]
+        n1 = total_head_size // head_size - 2 * n2
+        self.q_shape = (bs, n1, head_size)
+        self.out_torch = torch.empty((bs, hidden_size), dtype=dtype, device=device)
+        self.q_tmp = torch.empty((128 * 1, n1 * head_size), dtype=dtype, device=device)
+        self.k_tmp = torch.empty((bs, n2 * head_size), dtype=dtype, device=device)
+        self.v_tmp = torch.empty((bs, n2 * head_size), dtype=dtype, device=device)
+        self.last_state_check = torch.empty((128, hidden_size), dtype=dtype, device=device)
+        self.last_residual_check = torch.empty((128, hidden_size), dtype=dtype, device=device)
+        self.attn_inner_out = torch.zeros((128 * 1, n1, head_size), dtype=dtype, device=device)
+        self.residual_tmp = torch.empty((128, hidden_size), dtype=dtype, device=device)
+        self.residual_out = torch.empty((bs, hidden_size), dtype=dtype, device=device)
+        self.o_norm_out = torch.zeros([128, hidden_size], dtype=dtype, device=device)
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def pypto_decode(self, positions, hidden_states, residual):
+        bs = hidden_states.shape[0]
         rank = get_tensor_model_parallel_rank()
         world_size = get_tensor_model_parallel_world_size()
-        layer_list = list(self.layers[self.start_layer:self.end_layer])
         device = hidden_states.device
         if residual is None:
             residual = torch.rand(hidden_states.shape, dtype=hidden_states.dtype, device=device)
-        key_cache, value_cache = extract_kv_cache()
-        cos, sin = extract_cos_sin(layer_list[0], positions, hidden_states)
-        block_tables, slot_mapping, actual_seq_lens = extract_attn_metadata(layer_list[0])
-        tile_cfg = build_tile_config(world_size, layer_list[0])
-        softmax_scale = layer_list[0].self_attn.head_dim ** -0.5
+        cos, sin = extract_cos_sin(self.layers[self.start_layer], positions, hidden_states)
+        block_tables, slot_mapping, actual_seq_lens = extract_attn_metadata(self.layers[self.start_layer])
+        tile_cfg = build_tile_config(world_size, self.layers[self.start_layer])
+        softmax_scale = self.layers[self.start_layer].self_attn.head_dim ** -0.5
         group_name = get_tp_group().device_group._get_backend(device).get_hccl_comm_name(rank)
 
         out_torch, residual_out = _qwen3_decode_pypto(
-            layer_num=len(layer_list),
+            layer_num=(self.end_layer - self.start_layer + 1),
             hidden_states=hidden_states,
             residual=residual,
             input_layernorm_weight=self.weights["input_layernorm_weight"],
@@ -539,20 +562,28 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             w2=self.weights["w2"],
             cos=cos,
             sin=sin,
-            key_cache=key_cache,
-            value_cache=value_cache,
+            key_cache=self.key_cache,
+            value_cache=self.value_cache,
             block_tables=block_tables,
             actual_seq_lens=actual_seq_lens,
             slot_mapping=slot_mapping,
+            out_torch=self.out_torch,
+            o_norm_out=self.o_norm_out,
+            q_tmp=self.q_tmp,
+            k_tmp=self.k_tmp,
+            v_tmp=self.v_tmp,
+            last_state_check=self.last_state_check,
+            last_residual_check=self.last_residual_check,
+            attn_inner_out=self.attn_inner_out,
+            residual_tmp=self.residual_tmp,
+            residual_out=self.residual_out,
             eps=1e-5,
-            enable_residual=True,
-            num_decode_tokens=0,
             softmax_scale=softmax_scale,
             tile_cfg=tile_cfg,
             group_name=group_name,
             world_size=world_size
         )
-        return out_torch, residual_out
+        return out_torch[:bs, :], residual_out[:bs, :]
 
     def forward(
         self,
