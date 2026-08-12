@@ -473,6 +473,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
+        self.exist_pypto_tensor = False
 
         if get_pp_group().is_first_rank or (
             config.tie_word_embeddings and get_pp_group().is_last_rank
@@ -506,14 +507,25 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             self.norm = PPMissingLayer()
         self.init_pypto_tensor()
 
-    def init_pypto_tensor(self):
-        dtype = torch.bfloat16
-        device = self.weights["qkv_proj_weight"].device
+    def init_pypto_tensor(self, hidden_states):
+        if self.exist_pypto_tensor:
+            return
         bs = 128
         hidden_size = 5120
+        dtype = hidden_states.dtype
+        device = hidden_states.device
         total_head_size = self.weights["qkv_proj_weight"].shape[-1]
         head_size = self.weights["q_norm_weight"].shape[-1]
+
+        rank = get_tensor_model_parallel_rank()
+        self.world_size = get_tensor_model_parallel_world_size()
+        self.block_tables, self.slot_mapping, self.actual_seq_lens = extract_attn_metadata(self.layers[self.start_layer])
+        self.actual_seq_lens = self.actual_seq_lens.to(device)
+        self.tile_cfg = build_tile_config(world_size, self.layers[self.start_layer])
+        self.softmax_scale = self.layers[self.start_layer].self_attn.head_dim ** -0.5
+        self.group_name = get_tp_group().device_group._get_backend(device).get_hccl_comm_name(rank)
         self.key_cache, self.value_cache = extract_kv_caches()
+
         kv_shape = self.key_cache.shape
         n2 = kv_shape[-2]
         n1 = total_head_size // head_size - 2 * n2
@@ -528,22 +540,17 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         self.residual_tmp = torch.empty((128, hidden_size), dtype=dtype, device=device)
         self.residual_out = torch.empty((bs, hidden_size), dtype=dtype, device=device)
         self.o_norm_out = torch.zeros([128, hidden_size], dtype=dtype, device=device)
+        self.exist_pypto_tensor = True
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def pypto_decode(self, positions, hidden_states, residual):
         bs = hidden_states.shape[0]
-        rank = get_tensor_model_parallel_rank()
-        world_size = get_tensor_model_parallel_world_size()
-        device = hidden_states.device
         if residual is None:
-            residual = torch.rand(hidden_states.shape, dtype=hidden_states.dtype, device=device)
+            residual = torch.rand(hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device)
         cos, sin = extract_cos_sin(self.layers[self.start_layer], positions, hidden_states)
-        block_tables, slot_mapping, actual_seq_lens = extract_attn_metadata(self.layers[self.start_layer])
-        tile_cfg = build_tile_config(world_size, self.layers[self.start_layer])
-        softmax_scale = self.layers[self.start_layer].self_attn.head_dim ** -0.5
-        group_name = get_tp_group().device_group._get_backend(device).get_hccl_comm_name(rank)
+        eelf.init_pypto_tensor(hidden_states)
 
         out_torch, residual_out = _qwen3_decode_pypto(
             layer_num=(self.end_layer - self.start_layer + 1),
@@ -564,9 +571,9 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             sin=sin,
             key_cache=self.key_cache,
             value_cache=self.value_cache,
-            block_tables=block_tables,
-            actual_seq_lens=actual_seq_lens,
-            slot_mapping=slot_mapping,
+            block_tables=self.block_tables,
+            actual_seq_lens=self.actual_seq_lens,
+            slot_mapping=self.slot_mapping,
             out_torch=self.out_torch,
             o_norm_out=self.o_norm_out,
             q_tmp=self.q_tmp,
@@ -578,10 +585,10 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             residual_tmp=self.residual_tmp,
             residual_out=self.residual_out,
             eps=1e-5,
-            softmax_scale=softmax_scale,
-            tile_cfg=tile_cfg,
-            group_name=group_name,
-            world_size=world_size
+            softmax_scale=self.softmax_scale,
+            tile_cfg=self.tile_cfg,
+            group_name=self.group_name,
+            world_size=self.world_size
         )
         return out_torch[:bs, :], residual_out[:bs, :]
 
