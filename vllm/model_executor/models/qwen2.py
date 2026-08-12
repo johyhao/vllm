@@ -544,10 +544,10 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         world_size = get_tensor_model_parallel_world_size()
         cos, sin = extract_cos_sin(self.layers[self.start_layer], positions, hidden_states)
         block_tables, slot_mapping, actual_seq_lens = extract_attn_metadata(self.layers[self.start_layer])
-        actual_seq_lens = actual_seq_lens.to(device)
+        actual_seq_lens = actual_seq_lens.to(hidden_states.device)
         tile_cfg = build_tile_config(world_size, self.layers[self.start_layer])
         softmax_scale = self.layers[self.start_layer].self_attn.head_dim ** -0.5
-        group_name = get_tp_group().device_group._get_backend(device).get_hccl_comm_name(rank)
+        group_name = get_tp_group().device_group._get_backend(hidden_states.device).get_hccl_comm_name(rank)
 
         out_torch, residual_out = _qwen3_decode_pypto(
             layer_num=(self.end_layer - self.start_layer + 1),
